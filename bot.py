@@ -43,6 +43,8 @@ def is_autorizado(update: Update) -> bool:
     return str(update.effective_user.id) == str(ALLOWED_USER)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    await update.message.reply_text(f"Seu chat_id: {chat_id}")
     if not is_autorizado(update):
         await update.message.reply_text("❌ Acesso não autorizado.")
         return
