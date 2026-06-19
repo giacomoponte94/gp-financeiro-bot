@@ -33,7 +33,7 @@ Sua função é interpretar mensagens sobre gastos e receitas e retornar JSON es
 Data de hoje: {hoje}
 
 Categorias válidas para GASTO:
-Alimentação, Gasolina, Financiamento, Consórcio, XP, Santander, Nubank, 
+Alimentação, Gasolina, Financiamento, Consórcio, XP, Santander, Nubank,
 Internet, Vivo, MEI, Seguro, Prudential, Saúde, Lazer, Compras, Negócio, Outros
 
 Categorias válidas para RECEITA:
@@ -43,12 +43,9 @@ Formas de pagamento possíveis: pix, crédito, débito, dinheiro, transferência
 Bancos/cartões: nubank, inter, c6, santander, xp, caixa, bradesco, itaú
 
 Regras de data:
-- "ontem" = {ontem}
-- "hoje" = {hoje}
-- "anteontem" = {anteontem}
-- Dias da semana: calcule relativo ao hoje
-- "dia 10" = dia 10 do mês atual
-- Se não mencionar data, use hoje
+- Datas relativas já foram substituídas no texto por datas no formato YYYY-MM-DD
+- "dia 10" = dia 10 do mês atual ({ano}-{mes}-10)
+- Se não mencionar data, use {hoje}
 
 Retorne APENAS JSON válido, sem texto adicional, neste formato:
 {{
@@ -82,15 +79,29 @@ def is_autorizado(update: Update) -> bool:
         return True
     return str(update.effective_user.id) == str(ALLOWED_USER)
 
+def substituir_datas_relativas(texto: str, hoje: date) -> str:
+    """Substitui ontem/hoje/anteontem por datas ISO antes de enviar ao modelo."""
+    ontem = hoje - timedelta(days=1)
+    anteontem = hoje - timedelta(days=2)
+    texto = re.sub(r'\banteontem\b', anteontem.isoformat(), texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bontem\b', ontem.isoformat(), texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bhoje\b', hoje.isoformat(), texto, flags=re.IGNORECASE)
+    return texto
+
 async def interpretar_com_claude(texto: str) -> dict:
     hoje = date.today()
     ontem = hoje - timedelta(days=1)
     anteontem = hoje - timedelta(days=2)
 
+    # Substitui datas relativas antes de enviar ao modelo
+    texto_claude = substituir_datas_relativas(texto, hoje)
+
     system = SYSTEM_PROMPT.format(
         hoje=hoje.isoformat(),
         ontem=ontem.isoformat(),
-        anteontem=anteontem.isoformat()
+        anteontem=anteontem.isoformat(),
+        ano=hoje.year,
+        mes=f"{hoje.month:02d}"
     )
 
     try:
@@ -106,12 +117,11 @@ async def interpretar_com_claude(texto: str) -> dict:
                     "model": "claude-sonnet-4-6",
                     "max_tokens": 500,
                     "system": system,
-                    "messages": [{"role": "user", "content": texto}]
+                    "messages": [{"role": "user", "content": texto_claude}]
                 }
             )
             data = resp.json()
             raw = data["content"][0]["text"].strip()
-            # Remove markdown se vier
             raw = re.sub(r"```json|```", "", raw).strip()
             return json.loads(raw)
     except Exception as e:
