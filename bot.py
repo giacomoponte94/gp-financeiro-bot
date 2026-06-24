@@ -58,6 +58,7 @@ Anteontem: {anteontem}
 - Vivo: celular vivo, plano vivo
 - MEI: das, guia mei, imposto mei
 - Transporte: uber, 99, táxi, ônibus, estacionamento, pedágio
+- Devolução Mateus: qualquer pagamento referente à conta conjunta com Mateus (irmão) — pix direto, pagamento de conta de casa (energia/enel, água, internet) da conta conjunta, ou menção a "devolvi pro Mateus", "conta do Mateus", "conta compartilhada"
 - Outros: qualquer coisa que não se encaixa acima
 
 === CATEGORIAS DE RECEITA ===
