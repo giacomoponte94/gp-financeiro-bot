@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import unicodedata
 import httpx
 from datetime import datetime, date, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -26,6 +27,40 @@ MESES_MAP = {
     "agosto": 8, "setembro": 9, "outubro": 10,
     "novembro": 11, "dezembro": 12
 }
+
+
+def _sem_acento(s: str) -> str:
+    """Remove acentos e normaliza para comparação (março -> marco)."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
+# Mapa normalizado sem acento, para casar independente de acentuação
+MESES_MAP_NORM = {_sem_acento(k): v for k, v in MESES_MAP.items()}
+
+
+def resolver_mes(param):
+    """Converte comando_param (nome do mês, 'mês passado', etc.) em (mes, ano).
+
+    Retorna (None, None) quando não há mês específico → usa mês atual.
+    """
+    if not param:
+        return None, None
+    hoje = date.today()
+    p = _sem_acento(str(param).strip().lower())
+
+    if p in ("mes passado", "mes anterior", "mes_passado", "passado",
+             "anterior", "ultimo mes", "mes retrasado"):
+        mes = hoje.month - 1 or 12
+        ano = hoje.year if hoje.month > 1 else hoje.year - 1
+        return mes, ano
+
+    mes = MESES_MAP_NORM.get(p)
+    if mes:
+        # Se o mês pedido ainda não chegou neste ano, assume o ano anterior
+        ano = hoje.year if mes <= hoje.month else hoje.year - 1
+        return mes, ano
+
+    return None, None
 
 SYSTEM_PROMPT = """Você é um assistente financeiro pessoal do Giácomo Ponte, personal trainer em Fortaleza-CE.
 Interprete mensagens sobre gastos e receitas e retorne JSON estruturado.
@@ -84,7 +119,7 @@ pix, crédito, débito, dinheiro, transferência, boleto
 - banco sem forma explícita → infira pix para inter/c6/caixa/nubank
 
 === COMANDOS ===
-- "resumo", "quanto gastei", "saldo" → comando=resumo_mes
+- "resumo", "quanto gastei", "saldo" → comando=resumo_mes. Se o usuário citar um mês específico ("resumo junho", "resumo de maio", "resumo do mês passado"), coloque em comando_param o nome do mês em minúsculas (ex: "junho") ou "mes_passado" quando disser "mês passado"/"mês anterior". Sem menção de mês → comando_param=null (mês atual).
 - "resumo semana", "essa semana" → comando=resumo_semana
 - "por categoria" → comando=resumo_categoria
 - "últimos N" → comando=ultimos, param=N
@@ -93,7 +128,7 @@ pix, crédito, débito, dinheiro, transferência, boleto
 - "editar N" → comando=editar, param=N
 - "limite categoria valor" → comando=set_limite, param="categoria|valor"
 - "limites", "ver limites" → comando=ver_limites
-- "relatório", "relatorio" → comando=relatorio
+- "relatório", "relatorio" → comando=relatorio. Mesma regra de mês do resumo_mes: mês citado vai em comando_param (nome do mês ou "mes_passado").
 
 Retorne APENAS JSON válido:
 {{
@@ -678,8 +713,8 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
     param = resultado.get("comando_param")
 
     if cmd == "resumo_mes":
-        mes_num = MESES_MAP.get(str(param).lower()) if param else None
-        await resumo_mes(update, mes=mes_num)
+        mes_num, ano_num = resolver_mes(param)
+        await resumo_mes(update, mes=mes_num, ano=ano_num)
     elif cmd == "resumo_semana":
         await resumo_semana(update)
     elif cmd == "resumo_categoria":
@@ -697,8 +732,8 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif cmd == "ver_limites":
         await ver_limites(update)
     elif cmd == "relatorio":
-        mes_num = MESES_MAP.get(str(param).lower()) if param else None
-        await gerar_relatorio(update, mes=mes_num)
+        mes_num, ano_num = resolver_mes(param)
+        await gerar_relatorio(update, mes=mes_num, ano=ano_num)
     else:
         lancamentos = resultado.get("lancamentos", [])
         if lancamentos:
