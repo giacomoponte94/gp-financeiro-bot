@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import uuid
+import calendar
 import logging
 import unicodedata
 import httpx
@@ -36,6 +38,19 @@ def _sem_acento(s: str) -> str:
 
 # Mapa normalizado sem acento, para casar independente de acentuação
 MESES_MAP_NORM = {_sem_acento(k): v for k, v in MESES_MAP.items()}
+
+
+MESES_ABBR = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+              "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def add_meses(d: date, n: int) -> date:
+    """Soma n meses a uma data, ajustando o dia ao último dia do mês quando necessário."""
+    total = d.month - 1 + n
+    ano = d.year + total // 12
+    mes = total % 12 + 1
+    dia = min(d.day, calendar.monthrange(ano, mes)[1])
+    return date(ano, mes, dia)
 
 
 def resolver_mes(param):
@@ -117,6 +132,7 @@ pix, crédito, débito, dinheiro, transferência, boleto
 - Múltiplos lançamentos na mesma frase → múltiplos itens em lancamentos
 - "psico", "psi" = psicóloga = Saúde
 - banco sem forma explícita → infira pix para inter/c6/caixa/nubank
+- Compra parcelada: frases como "comprei X em 3x", "parcelei em 5 vezes", "3 parcelas de 50", "em 4x de 80" → inclua parcela_total=N no lançamento. O campo valor deve ser o valor de UMA parcela, nunca o total da compra. Se só souber o valor total, calcule valor = total / N. Ex: "tênis 300 em 3x" → valor=100, parcela_total=3. "comprei geladeira em 4x de 80" → valor=80, parcela_total=4. Sem parcelamento → parcela_total=null.
 
 === COMANDOS ===
 - "resumo", "quanto gastei", "saldo" → comando=resumo_mes. Se o usuário citar um mês específico ("resumo junho", "resumo de maio", "resumo do mês passado"), coloque em comando_param o nome do mês em minúsculas (ex: "junho") ou "mes_passado" quando disser "mês passado"/"mês anterior". Sem menção de mês → comando_param=null (mês atual).
@@ -140,7 +156,8 @@ Retorne APENAS JSON válido:
       "descricao": string resumida,
       "data": "YYYY-MM-DD",
       "forma_pagamento": string ou null,
-      "local": string ou null
+      "local": string ou null,
+      "parcela_total": número ou null
     }}
   ],
   "comando": null ou string,
@@ -227,6 +244,16 @@ async def registrar_lancamentos(update: Update, lancamentos: list):
     hoje = date.today()
     for l in lancamentos:
         try:
+            # Compra parcelada → gera grupo e insere N linhas, uma por mês
+            try:
+                parcela_total = int(l.get("parcela_total")) if l.get("parcela_total") else None
+            except (ValueError, TypeError):
+                parcela_total = None
+
+            if parcela_total and parcela_total > 1:
+                await registrar_parcelado(update, l, parcela_total, hoje)
+                continue
+
             result = supabase.table("financeiro").insert({
                 "tipo": l["tipo"],
                 "valor": l["valor"],
@@ -262,6 +289,88 @@ async def registrar_lancamentos(update: Update, lancamentos: list):
         except Exception as e:
             logger.error(f"Erro ao salvar: {e}")
             await update.message.reply_text("❌ Erro ao salvar.")
+
+async def registrar_parcelado(update: Update, l: dict, parcela_total: int, hoje: date):
+    """Insere N linhas em financeiro, uma por mês, com grupo_parcela compartilhado."""
+    try:
+        grupo = str(uuid.uuid4())
+        data_base = datetime.strptime(l.get("data", hoje.isoformat()), "%Y-%m-%d").date()
+        valor_parcela = round(float(l["valor"]), 2)
+        tipo = l.get("tipo", "gasto")
+
+        ids = []
+        for i in range(parcela_total):
+            data_parcela = add_meses(data_base, i)
+            result = supabase.table("financeiro").insert({
+                "tipo": tipo,
+                "valor": valor_parcela,
+                "categoria": l.get("categoria", "Outros"),
+                "descricao": l.get("descricao", ""),
+                "data": data_parcela.isoformat(),
+                "forma_pagamento": l.get("forma_pagamento"),
+                "local": l.get("local"),
+                "grupo_parcela": grupo,
+                "parcela_atual": i + 1,
+                "parcela_total": parcela_total
+            }).execute()
+            if result.data:
+                ids.append(result.data[0]["id"])
+
+        data_fim = add_meses(data_base, parcela_total - 1)
+        ini_fmt = f"{MESES_ABBR[data_base.month - 1]}/{data_base.year}"
+        fim_fmt = f"{MESES_ABBR[data_fim.month - 1]}/{data_fim.year}"
+        ids_txt = ", ".join(str(x) for x in ids)
+        forma = f" • {l['forma_pagamento']}" if l.get("forma_pagamento") else ""
+
+        await update.message.reply_text(
+            f"🗓️ *Compra parcelada registrada!*\n"
+            f"{parcela_total}x de *R$ {valor_parcela:.2f}* — {ini_fmt} a {fim_fmt}\n"
+            f"{l.get('categoria', 'Outros')}{forma}\n"
+            f"Grupo: `{grupo}`\n"
+            f"IDs: {ids_txt}\n\n"
+            f"_Apagar parcelas futuras: `apagar grupo {grupo}`_",
+            parse_mode="Markdown",
+            reply_markup=teclado_principal()
+        )
+
+        if tipo == "gasto":
+            await verificar_alertas(update, l.get("categoria", "Outros"), data_base.month, data_base.year)
+
+    except Exception as e:
+        logger.error(f"Erro parcelado: {e}")
+        await update.message.reply_text("❌ Erro ao registrar compra parcelada.")
+
+async def apagar_grupo(update: Update, grupo: str):
+    """Apaga todas as parcelas futuras (data >= hoje) de uma compra parcelada."""
+    try:
+        hoje = date.today()
+        result = supabase.table("financeiro").select(
+            "id,valor,data"
+        ).eq("grupo_parcela", grupo).gte("data", hoje.isoformat()).order("data").execute()
+        futuras = result.data or []
+
+        if not futuras:
+            await update.message.reply_text(
+                "📭 Nenhuma parcela futura encontrada para esse grupo.",
+                reply_markup=teclado_principal()
+            )
+            return
+
+        ids = [d["id"] for d in futuras]
+        total = sum(float(d["valor"]) for d in futuras)
+        supabase.table("financeiro").delete().eq("grupo_parcela", grupo).gte("data", hoje.isoformat()).execute()
+
+        ids_txt = ", ".join(str(x) for x in ids)
+        await update.message.reply_text(
+            f"🗑 *{len(ids)} parcela(s) futura(s) apagada(s)!*\n"
+            f"Total removido: R$ {total:.2f}\n"
+            f"IDs: {ids_txt}",
+            parse_mode="Markdown",
+            reply_markup=teclado_principal()
+        )
+    except Exception as e:
+        logger.error(f"Erro apagar grupo: {e}")
+        await update.message.reply_text("❌ Erro ao apagar grupo.")
 
 async def ultimos_lancamentos(update: Update, n=5):
     try:
@@ -668,6 +777,11 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # Comandos diretos sem IA
+    apagar_grupo_match = re.match(r"apagar\s+grupo\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", texto)
+    if apagar_grupo_match:
+        await apagar_grupo(update, apagar_grupo_match.group(1))
+        return
+
     apagar_match = re.match(r"apagar\s+(\d+|[uú]ltimo)", texto)
     if apagar_match:
         param = apagar_match.group(1)
