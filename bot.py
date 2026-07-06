@@ -10,6 +10,7 @@ from datetime import datetime, date, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
+from interpretador_local import interpretar as interpretar_local
 
 # --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -74,6 +75,49 @@ def resolver_mes(param):
         # Se o mês pedido ainda não chegou neste ano, assume o ano anterior
         ano = hoje.year if mes <= hoje.month else hoje.year - 1
         return mes, ano
+
+    return None, None
+
+
+def extrair_param_mes(texto: str):
+    """Procura menção a um mês (ou 'mês passado') em texto livre, para usar com resolver_mes."""
+    t = _sem_acento(texto.lower())
+    if re.search(r"mes\s+passado|mes\s+anterior|ultimo\s+mes|mes\s+retrasado", t):
+        return "mes_passado"
+    for nome in MESES_MAP.keys():
+        if _sem_acento(nome) in t:
+            return nome
+    return None
+
+
+def detectar_comando_texto(texto: str):
+    """Detecta comandos de consulta em texto livre (resumo, relatório, últimos, etc.).
+
+    Antes essa detecção vinha do campo `comando` retornado pela IA (Claude).
+    Como a interpretação agora é local (interpretador_local.py, sem detecção de
+    comando), essa função assume esse papel via regex antes de tentar
+    interpretar a mensagem como lançamento.
+    """
+    t = _sem_acento(texto.lower().strip())
+
+    if re.search(r"(resumo\s+(da\s+)?semana|essa\s+semana|semana\s+atual)", t):
+        return "resumo_semana", None
+
+    if re.search(r"por\s+categoria", t):
+        return "resumo_categoria", None
+
+    m = re.search(r"ultimos?\s+(\d+)", t)
+    if m:
+        return "ultimos", m.group(1)
+
+    if re.search(r"relatorio", t):
+        return "relatorio", extrair_param_mes(texto)
+
+    if re.search(r"^(ver\s+)?limites$", t):
+        return "ver_limites", None
+
+    if re.search(r"(^resumo\b|quanto\s+gastei|^saldo$)", t):
+        return "resumo_mes", extrair_param_mes(texto)
 
     return None, None
 
@@ -179,43 +223,47 @@ def is_autorizado(update: Update) -> bool:
         return True
     return str(update.effective_user.id) == str(ALLOWED_USER)
 
-async def interpretar_com_claude(texto: str) -> dict:
-    hoje = date.today()
-    ontem = hoje - timedelta(days=1)
-    anteontem = hoje - timedelta(days=2)
-
-    system = SYSTEM_PROMPT.format(
-        hoje=hoje.isoformat(),
-        ontem=ontem.isoformat(),
-        anteontem=anteontem.isoformat()
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 800,
-                    "system": system,
-                    "messages": [{"role": "user", "content": texto}]
-                }
-            )
-            data = resp.json()
-            if "error" in data:
-                logger.error(f"Claude API error: {data['error']}")
-                return {"erro": data["error"].get("message", "erro api")}
-            raw = data["content"][0]["text"].strip()
-            raw = re.sub(r"```json|```", "", raw).strip()
-            return json.loads(raw)
-    except Exception as e:
-        logger.error(f"Erro Claude API: {e}")
-        return {"erro": str(e)}
+# DESATIVADO: Railway está bloqueando api.anthropic.com, então a interpretação
+# de linguagem natural passou a ser feita localmente (ver interpretador_local.py).
+# Mantido aqui comentado como referência caso a rede volte a permitir.
+#
+# async def interpretar_com_claude(texto: str) -> dict:
+#     hoje = date.today()
+#     ontem = hoje - timedelta(days=1)
+#     anteontem = hoje - timedelta(days=2)
+#
+#     system = SYSTEM_PROMPT.format(
+#         hoje=hoje.isoformat(),
+#         ontem=ontem.isoformat(),
+#         anteontem=anteontem.isoformat()
+#     )
+#
+#     try:
+#         async with httpx.AsyncClient(timeout=20) as client:
+#             resp = await client.post(
+#                 "https://api.anthropic.com/v1/messages",
+#                 headers={
+#                     "x-api-key": ANTHROPIC_KEY,
+#                     "anthropic-version": "2023-06-01",
+#                     "content-type": "application/json"
+#                 },
+#                 json={
+#                     "model": "claude-sonnet-4-6",
+#                     "max_tokens": 800,
+#                     "system": system,
+#                     "messages": [{"role": "user", "content": texto}]
+#                 }
+#             )
+#             data = resp.json()
+#             if "error" in data:
+#                 logger.error(f"Claude API error: {data['error']}")
+#                 return {"erro": data["error"].get("message", "erro api")}
+#             raw = data["content"][0]["text"].strip()
+#             raw = re.sub(r"```json|```", "", raw).strip()
+#             return json.loads(raw)
+#     except Exception as e:
+#         logger.error(f"Erro Claude API: {e}")
+#         return {"erro": str(e)}
 
 async def verificar_alertas(update: Update, categoria: str, mes: int, ano: int):
     try:
@@ -812,51 +860,39 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tipo = context.user_data.pop("aguardando_tipo")
         texto_orig = f"{'gastei' if tipo == 'gasto' else 'recebi'} {texto_orig}"
 
-    # Envia para Claude interpretar
-    await update.message.reply_chat_action("typing")
-    resultado = await interpretar_com_claude(texto_orig)
-
-    if "erro" in resultado:
-        await update.message.reply_text(
-            "⚠️ Não entendi. Tenta:\n`gastei 150 gasolina`\n`recebi 650 Cecília`",
-            parse_mode="Markdown"
-        )
-        return
-
-    cmd = resultado.get("comando")
-    param = resultado.get("comando_param")
+    # Comandos de consulta em texto livre (resumo, relatório, últimos, etc.)
+    cmd, param = detectar_comando_texto(texto_orig)
 
     if cmd == "resumo_mes":
         mes_num, ano_num = resolver_mes(param)
         await resumo_mes(update, mes=mes_num, ano=ano_num)
+        return
     elif cmd == "resumo_semana":
         await resumo_semana(update)
+        return
     elif cmd == "resumo_categoria":
         await resumo_categoria(update)
+        return
     elif cmd == "ultimos":
         await ultimos_lancamentos(update, n=int(param) if param else 5)
-    elif cmd == "apagar_ultimo":
-        await apagar_lancamento(update, "ultimo")
-    elif cmd == "apagar_id":
-        await apagar_lancamento(update, int(param))
-    elif cmd == "editar":
-        await iniciar_edicao(update, context, int(param))
-    elif cmd == "set_limite":
-        await set_limite(update, str(param))
+        return
     elif cmd == "ver_limites":
         await ver_limites(update)
+        return
     elif cmd == "relatorio":
         mes_num, ano_num = resolver_mes(param)
         await gerar_relatorio(update, mes=mes_num, ano=ano_num)
+        return
+
+    # Interpretador local de linguagem natural (sem API externa — ver interpretador_local.py)
+    lancamentos = interpretar_local(texto_orig)
+    if lancamentos:
+        await registrar_lancamentos(update, lancamentos)
     else:
-        lancamentos = resultado.get("lancamentos", [])
-        if lancamentos:
-            await registrar_lancamentos(update, lancamentos)
-        else:
-            await update.message.reply_text(
-                "⚠️ Não entendi. Tenta:\n`gastei 150 gasolina`\n`recebi 650 Cecília`",
-                parse_mode="Markdown"
-            )
+        await update.message.reply_text(
+            "⚠️ Não entendi. Tenta:\n`gastei 150 gasolina`\n`recebi 650 Cecília`",
+            parse_mode="Markdown"
+        )
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
