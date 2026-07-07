@@ -144,6 +144,25 @@ def _dividir_lancamentos(texto):
     return [p.strip() for p in partes if p.strip()]
 
 
+def _parse_parcelas(texto):
+    """Detecta parcelamento: 'em 3x', '3 vezes', 'parcelado em 5x'."""
+    texto = texto.lower()
+
+    m = re.search(r'(\d{1,2})\s*x\b', texto)
+    if m:
+        n = int(m.group(1))
+        if 2 <= n <= 48:
+            return n
+
+    m = re.search(r'(\d{1,2})\s*vezes', texto)
+    if m:
+        n = int(m.group(1))
+        if 2 <= n <= 48:
+            return n
+
+    return None
+
+
 def interpretar(mensagem):
     """
     Recebe a mensagem crua do usuário e devolve uma lista de lançamentos:
@@ -158,9 +177,27 @@ def interpretar(mensagem):
             continue  # sem valor identificável, não é um lançamento válido
 
         tipo = _parse_tipo(parte)
+        parcelas = _parse_parcelas(parte)
+
+        valor_total = valor
+        valor_parcela = None
+        if parcelas:
+            # "3x de 100" -> 100 é o valor da parcela, total = 100*3
+            m = re.search(r'\d{1,2}\s*x\s*de\s*r?\$?\s*(\d+(?:[.,]\d{1,2})?)', parte.lower())
+            if m:
+                val = m.group(1).replace(".", "").replace(",", ".") if "," in m.group(1) else m.group(1)
+                valor_parcela = float(val)
+                valor_total = round(valor_parcela * parcelas, 2)
+            else:
+                # valor encontrado é o total; parcela = total / N
+                valor_total = valor
+                valor_parcela = round(valor / parcelas, 2)
+
         resultados.append({
             "tipo": tipo,
-            "valor": valor,
+            "valor": valor_total,
+            "parcelas": parcelas,
+            "valor_parcela": valor_parcela,
             "categoria": _parse_categoria(parte, tipo=tipo),
             "data": _parse_data(parte).isoformat(),
             "forma_pagamento": _parse_forma_pagamento(parte),
@@ -178,6 +215,8 @@ if __name__ == "__main__":
         "recebi 850 da Morgana hoje via pix",
         "gastei 50 de almoço e 100 de gasolina",
         "gastei 30 no consórcio dia 5 c6",
+        "comprei em 3x de 100 um tênis",
+        "comprei um celular de 1200 em 4x",
     ]
     for t in testes:
         print(t, "->", interpretar(t))

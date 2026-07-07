@@ -887,7 +887,17 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Interpretador local de linguagem natural (sem API externa — ver interpretador_local.py)
     lancamentos = interpretar_local(texto_orig)
     if lancamentos:
-        await registrar_lancamentos(update, lancamentos)
+        hoje = date.today()
+        simples = []
+        for item in lancamentos:
+            if item.get("parcelas"):
+                l_parcela = dict(item)
+                l_parcela["valor"] = item["valor_parcela"]
+                await registrar_parcelado(update, l_parcela, item["parcelas"], hoje)
+            else:
+                simples.append(item)
+        if simples:
+            await registrar_lancamentos(update, simples)
     else:
         await update.message.reply_text(
             "⚠️ Não entendi. Tenta:\n`gastei 150 gasolina`\n`recebi 650 Cecília`",
