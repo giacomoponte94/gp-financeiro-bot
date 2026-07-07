@@ -388,6 +388,47 @@ async def registrar_parcelado(update: Update, l: dict, parcela_total: int, hoje:
         logger.error(f"Erro parcelado: {e}")
         await update.message.reply_text("❌ Erro ao registrar compra parcelada.")
 
+async def sincronizar_divida(l: dict, parcela_total: int, hoje: date):
+    """Espelha uma compra parcelada detectada por linguagem natural em `dividas` +
+    `dividas_parcelas`, para que ela entre no total de dívidas e na projeção de
+    quitação (que não leem `financeiro`).
+
+    Só é chamada no fluxo de texto livre (interpretador_local), não em compras
+    estruturadas manuais. Falha aqui é só logada — o gasto já foi gravado em
+    `financeiro` antes desta chamada e não pode ser perdido por causa disso.
+    """
+    try:
+        data_base = datetime.strptime(l.get("data", hoje.isoformat()), "%Y-%m-%d").date()
+        valor_parcela = round(float(l["valor"]), 2)
+        saldo_total = round(valor_parcela * parcela_total, 2)
+
+        divida_result = supabase.table("dividas").insert({
+            "descricao": l.get("descricao", "Compra parcelada"),
+            "titular": "Giácomo",
+            "saldo_total": saldo_total,
+            "parcela_mensal": valor_parcela,
+            "parcelas_restantes": parcela_total,
+            "tipo": "compra_parcelada",
+            "status": "ativo",
+            "observacao": f"Criada automaticamente via bot em {hoje.strftime('%d/%m/%Y')}"
+        }).execute()
+        divida_id = divida_result.data[0]["id"]
+
+        parcelas_rows = []
+        for i in range(parcela_total):
+            data_parcela = add_meses(data_base, i)
+            parcelas_rows.append({
+                "divida_id": divida_id,
+                "mes": data_parcela.month,
+                "ano": data_parcela.year,
+                "valor": valor_parcela,
+                "pago": False
+            })
+        supabase.table("dividas_parcelas").insert(parcelas_rows).execute()
+
+    except Exception as e:
+        logger.error(f"Erro ao sincronizar dívida: {e}")
+
 async def apagar_grupo(update: Update, grupo: str):
     """Apaga todas as parcelas futuras (data >= hoje) de uma compra parcelada."""
     try:
@@ -894,6 +935,7 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 l_parcela = dict(item)
                 l_parcela["valor"] = item["valor_parcela"]
                 await registrar_parcelado(update, l_parcela, item["parcelas"], hoje)
+                await sincronizar_divida(l_parcela, item["parcelas"], hoje)
             else:
                 simples.append(item)
         if simples:
