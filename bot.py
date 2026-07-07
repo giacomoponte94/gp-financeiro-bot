@@ -6,7 +6,8 @@ import calendar
 import logging
 import unicodedata
 import httpx
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
@@ -223,6 +224,15 @@ def is_autorizado(update: Update) -> bool:
         return True
     return str(update.effective_user.id) == str(ALLOWED_USER)
 
+RESPOSTAS_CONFIRMACAO = ("sim", "s", "ok", "confirma", "confirmado", "certo", "isso", "correto")
+
+
+def eh_baixa_confianca(item: dict) -> bool:
+    """Baixa confiança: categoria caiu no default 'Outros' (gasto sem match em
+    nenhuma palavra-chave do dicionário de categorias) ou a forma de pagamento
+    não foi identificada."""
+    return item.get("categoria") == "Outros" or item.get("forma_pagamento") is None
+
 # DESATIVADO: Railway está bloqueando api.anthropic.com, então a interpretação
 # de linguagem natural passou a ser feita localmente (ver interpretador_local.py).
 # Mantido aqui comentado como referência caso a rede volte a permitir.
@@ -285,6 +295,50 @@ async def verificar_alertas(update: Update, categoria: str, mes: int, ano: int):
             await update.message.reply_text(f"⚠️ *Atenção!* {categoria} em {pct:.0f}% do limite\nR$ {gasto_total:.2f} / R$ {limite:.2f}", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Erro alertas: {e}")
+
+async def registrar_item_interpretado(update: Update, item: dict, hoje: date):
+    """Grava um único lançamento vindo do interpretador local, respeitando o
+    fluxo de parcelamento já existente (registrar_parcelado + sincronizar_divida)
+    quando aplicável."""
+    if item.get("parcelas"):
+        l_parcela = dict(item)
+        l_parcela["valor"] = item["valor_parcela"]
+        await registrar_parcelado(update, l_parcela, item["parcelas"], hoje)
+        await sincronizar_divida(l_parcela, item["parcelas"], hoje)
+    else:
+        await registrar_lancamentos(update, [item])
+
+async def perguntar_confirmacao(update: Update, item: dict):
+    await update.message.reply_text(
+        f"Entendi: {item.get('descricao', '')}, R$ {float(item['valor']):.2f}, "
+        f"categoria {item.get('categoria', 'Outros')}. Confirma? (sim / corrigir categoria)"
+    )
+
+async def processar_confirmacao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fila = context.user_data.get("confirmacao_fila") or []
+    if not fila:
+        context.user_data.pop("confirmacao_fila", None)
+        context.user_data.pop("confirmacao_hoje", None)
+        return
+
+    texto = update.message.text.strip()
+    item = fila[0]
+    hoje = date.fromisoformat(context.user_data.get("confirmacao_hoje", date.today().isoformat()))
+
+    if texto.lower().strip().rstrip(".!") not in RESPOSTAS_CONFIRMACAO:
+        cat_match = re.match(r"categoria\s+(.+)", texto, flags=re.IGNORECASE)
+        nova_categoria = cat_match.group(1).strip() if cat_match else texto.strip()
+        item["categoria"] = nova_categoria.capitalize()
+
+    await registrar_item_interpretado(update, item, hoje)
+
+    fila.pop(0)
+    if fila:
+        context.user_data["confirmacao_fila"] = fila
+        await perguntar_confirmacao(update, fila[0])
+    else:
+        context.user_data.pop("confirmacao_fila", None)
+        context.user_data.pop("confirmacao_hoje", None)
 
 async def registrar_lancamentos(update: Update, lancamentos: list):
     if not lancamentos:
@@ -507,6 +561,25 @@ async def apagar_lancamento(update: Update, id_alvo):
         )
     except Exception as e:
         logger.error(f"Erro apagar: {e}")
+
+async def corrigir_categoria(update: Update, id_alvo: int, nova_categoria: str):
+    """Atualiza a categoria de uma linha existente em `financeiro` (não cria linha
+    nova) — usado tanto avulso quanto em resposta à revisão semanal de 'Outros'."""
+    try:
+        result = supabase.table("financeiro").select("id,categoria").eq("id", id_alvo).execute()
+        if not result.data:
+            await update.message.reply_text(f"❌ ID {id_alvo} não encontrado.")
+            return
+
+        cat = nova_categoria.strip().capitalize()
+        supabase.table("financeiro").update({"categoria": cat}).eq("id", id_alvo).execute()
+        await update.message.reply_text(
+            f"✅ ID `{id_alvo}` atualizado para *{cat}*.",
+            parse_mode="Markdown", reply_markup=teclado_principal()
+        )
+    except Exception as e:
+        logger.error(f"Erro corrigir categoria: {e}")
+        await update.message.reply_text("❌ Erro ao corrigir categoria.")
 
 async def iniciar_edicao(update: Update, context: ContextTypes.DEFAULT_TYPE, id_alvo: int):
     try:
@@ -839,6 +912,11 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await processar_edicao(update, context)
         return
 
+    # Se há lançamentos de baixa confiança aguardando confirmação
+    if "confirmacao_fila" in context.user_data:
+        await processar_confirmacao(update, context)
+        return
+
     # Botões
     if texto in ["💸 gasto", "💰 receita"]:
         tipo = "gasto" if "gasto" in texto else "receita"
@@ -896,6 +974,11 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await set_limite(update, f"{cat}|{val}")
         return
 
+    corrigir_match = re.match(r"corrigir\s+(\d+)\s+(.+)", texto)
+    if corrigir_match:
+        await corrigir_categoria(update, int(corrigir_match.group(1)), corrigir_match.group(2).strip())
+        return
+
     # Aguardando após botão
     if "aguardando_tipo" in context.user_data:
         tipo = context.user_data.pop("aguardando_tipo")
@@ -929,8 +1012,11 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lancamentos = interpretar_local(texto_orig)
     if lancamentos:
         hoje = date.today()
+        confiaveis = [item for item in lancamentos if not eh_baixa_confianca(item)]
+        baixa_conf = [item for item in lancamentos if eh_baixa_confianca(item)]
+
         simples = []
-        for item in lancamentos:
+        for item in confiaveis:
             if item.get("parcelas"):
                 l_parcela = dict(item)
                 l_parcela["valor"] = item["valor_parcela"]
@@ -940,17 +1026,71 @@ async def processar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 simples.append(item)
         if simples:
             await registrar_lancamentos(update, simples)
+
+        # Lançamentos de baixa confiança (categoria "Outros" ou forma de pagamento
+        # não identificada) esperam confirmação do usuário antes de gravar
+        if baixa_conf:
+            context.user_data["confirmacao_fila"] = baixa_conf
+            context.user_data["confirmacao_hoje"] = hoje.isoformat()
+            await perguntar_confirmacao(update, baixa_conf[0])
     else:
         await update.message.reply_text(
             "⚠️ Não entendi. Tenta:\n`gastei 150 gasolina`\n`recebi 650 Cecília`",
             parse_mode="Markdown"
         )
 
+async def revisar_outros_semanal(context: ContextTypes.DEFAULT_TYPE):
+    """Job semanal: lista os lançamentos com categoria 'Outros' da semana e pede
+    revisão. Não envia nada se não houver nenhum."""
+    if not ALLOWED_USER:
+        return
+    try:
+        hoje = date.today()
+        inicio_semana = hoje - timedelta(days=hoje.weekday())
+        result = supabase.table("financeiro").select("id,valor,descricao,data").eq(
+            "categoria", "Outros"
+        ).gte("data", inicio_semana.isoformat()).lte("data", hoje.isoformat()).order("data").execute()
+        dados = result.data or []
+
+        if not dados:
+            return
+
+        linhas = "\n".join(
+            f"`ID {d['id']}` — {d['descricao'][:40]} — R$ {float(d['valor']):.2f}"
+            for d in dados
+        )
+        texto = (
+            f"🗂 *Revisão semanal — categoria \"Outros\"*\n"
+            f"({inicio_semana.strftime('%d/%m')} a {hoje.strftime('%d/%m')})\n\n"
+            f"{linhas}\n\n"
+            f"Revisa e me diz a categoria certa de cada um:\n"
+            f"`corrigir <ID> <categoria>`\n"
+            f"Ex: `corrigir {dados[0]['id']} Alimentação`"
+        )
+        await context.bot.send_message(chat_id=int(ALLOWED_USER), text=texto, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Erro revisão semanal 'Outros': {e}")
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ajuda", ajuda))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_mensagem))
+
+    if app.job_queue:
+        # Domingo 20h (horário de Fortaleza) — revisão semanal de lançamentos "Outros".
+        # PTB usa 0-6 = domingo-sábado para `days`.
+        app.job_queue.run_daily(
+            revisar_outros_semanal,
+            time=dtime(hour=20, minute=0, tzinfo=ZoneInfo("America/Fortaleza")),
+            days=(0,),
+        )
+    else:
+        logger.warning(
+            "JobQueue indisponível — revisão semanal de 'Outros' desativada. "
+            "Instale python-telegram-bot[job-queue]."
+        )
+
     logger.info("Bot GP Financeiro iniciado...")
     app.run_polling(drop_pending_updates=True)
 
